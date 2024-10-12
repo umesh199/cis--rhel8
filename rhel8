@@ -1,0 +1,277 @@
+---
+- name: Harden RHEL 8 for CIS Compliance
+  hosts: all
+  become: yes
+  tasks:
+
+    ### 1. Initial Setup
+    - name: Ensure all packages are up to date
+      yum:
+        name: '*'
+        state: latest
+
+    - name: Ensure firewall is enabled and running
+      service:
+        name: firewalld
+        state: started
+        enabled: yes
+
+    ### 2. Secure Boot Settings
+    - name: Set SELinux to enforcing
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=enforcing'
+      notify: reboot
+
+    ### 3. User Accounts and Authentication
+    - name: Set password expiration for users
+      user:
+        name: "{{ item }}"
+        password_expire_max: 90
+        password_expire_min: 7
+        password_warn_age: 14
+      loop: "{{ ansible_users }}"
+
+    - name: Disable root login via SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PermitRootLogin'
+        line: 'PermitRootLogin no'
+      notify: restart ssh
+
+    - name: Set SSH protocol to 2
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^Protocol'
+        line: 'Protocol 2'
+      notify: restart ssh
+
+    - name: Disable password authentication for SSH
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: restart ssh
+
+    - name: Ensure all accounts have a valid shell
+      command: usermod -s /bin/bash {{ item }}
+      loop: "{{ ansible_users }}"
+
+    - name: Lock inactive accounts
+      user:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - user1
+        - user2
+
+    ### 4. Session Settings
+    - name: Configure SSH Idle Timeout
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^ClientAliveInterval'
+        line: 'ClientAliveInterval 300'
+      notify: restart ssh
+
+    - name: Set SSH MaxAuthTries
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^MaxAuthTries'
+        line: 'MaxAuthTries 3'
+      notify: restart ssh
+
+    - name: Set SSH MaxSessions
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^MaxSessions'
+        line: 'MaxSessions 10'
+      notify: restart ssh
+
+    ### 5. System Maintenance
+    - name: Disable unused services
+      service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: no
+      loop:
+        - nfs
+        - rpcbind
+        - telnet.socket
+        - rsh.socket
+        - rsyncd
+        - avahi-daemon
+        - cups
+
+    - name: Remove unwanted files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/motd
+        - /etc/issue
+        - /etc/issue.net
+
+    ### 6. Auditing and Logging
+    - name: Ensure audit package is installed
+      yum:
+        name: audit
+        state: present
+
+    - name: Ensure auditd service is enabled and running
+      service:
+        name: auditd
+        state: started
+        enabled: yes
+
+    - name: Set permissions on /etc/shadow
+      file:
+        path: /etc/shadow
+        owner: root
+        group: root
+        mode: '0000'
+
+    - name: Set permissions on audit logs
+      command: chmod 600 /var/log/audit/audit.log
+
+    ### 7. Firewall and Network Configuration
+    - name: Ensure firewall rules are configured for SSH
+      firewalld:
+        service: ssh
+        permanent: yes
+        state: enabled
+      notify: restart firewalld
+
+    - name: Disable IPv4 and IPv6 forwarding
+      sysctl:
+        name: "{{ item }}"
+        value: '0'
+        state: present
+        reload: yes
+      loop:
+        - net.ipv4.ip_forward
+        - net.ipv6.conf.all.forwarding
+
+    ### 8. System Time Configuration
+    - name: Ensure NTP is installed
+      yum:
+        name: chrony
+        state: present
+
+    - name: Ensure chronyd is running and enabled
+      service:
+        name: chronyd
+        state: started
+        enabled: yes
+
+    - name: Enable NTP synchronization
+      command: timedatectl set-ntp true
+
+    ### 9. File Permissions
+    - name: Set permissions on /etc/passwd
+      file:
+        path: /etc/passwd
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Set permissions on /etc/group
+      file:
+        path: /etc/group
+        owner: root
+        group: root
+        mode: '0644'
+
+    ### 10. Additional Controls
+    - name: Ensure the system is set to a specific timezone
+      command: timedatectl set-timezone UTC
+
+    - name: Ensure no duplicate UIDs exist
+      command: awk -F: '{ if ($3 in uid) { print $1 " has duplicate UID " $3 } uid[$3] = $1 }' /etc/passwd
+
+    - name: Ensure permissions on /etc/gshadow are configured
+      file:
+        path: /etc/gshadow
+        owner: root
+        group: root
+        mode: '0000'
+
+    - name: Ensure permissions on /etc/security/passwd are configured
+      file:
+        path: /etc/security/passwd
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Ensure /tmp is mounted with noexec
+      mount:
+        path: /tmp
+        opts: noexec
+        state: remounted
+
+    - name: Ensure /var/tmp is mounted with noexec
+      mount:
+        path: /var/tmp
+        opts: noexec
+        state: remounted
+
+    - name: Ensure core dumps are restricted
+      lineinfile:
+        path: /etc/security/limits.conf
+        line: '*               hard    core            0'
+
+    ### 11. Disable Unused Filesystems
+    - name: Ensure unused filesystems are disabled
+      mount:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /dev/shm
+        - /proc/fs/nfsd
+
+    ### 12. Verify System Configuration
+    - name: Verify system is not a DNS server
+      command: systemctl status named
+      register: dns_status
+      ignore_errors: true
+
+    - name: Ensure that DNS server is not running
+      fail:
+        msg: "DNS server is running. Disable it."
+      when: dns_status.rc == 0
+
+    ### 13. Miscellaneous Security Settings
+    - name: Disable cron.allow and at.allow files
+      file:
+        path: "/etc/{{ item }}"
+        state: absent
+      loop:
+        - cron.allow
+        - at.allow
+
+    - name: Ensure all login attempts are logged
+      lineinfile:
+        path: /etc/rsyslog.conf
+        line: "authpriv.*   /var/log/secure"
+      notify: restart rsyslog
+
+    ### 14. Reboot if necessary
+    handlers:
+      - name: restart ssh
+        service:
+          name: sshd
+          state: restarted
+
+      - name: restart firewalld
+        service:
+          name: firewalld
+          state: restarted
+
+      - name: restart rsyslog
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: reboot
+        reboot:
+          msg: "Rebooting for SELinux enforcing setting"
